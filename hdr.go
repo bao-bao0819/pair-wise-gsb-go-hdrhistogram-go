@@ -287,6 +287,10 @@ func (h *Histogram) RecordValue(v int64) error {
 // at an expected interval (e.g., doing jitter analysis). Processes which are
 // recording ad-hoc values (e.g., latency for incoming requests) can't take
 // advantage of this.
+//
+// The additional fill-in values are synthetic, not independent observations,
+// so histograms populated with this method must not use them as the N behind a
+// QuantileConfidenceIntervalAt DKW guarantee.
 func (h *Histogram) RecordCorrectedValue(v, expectedInterval int64) error {
 	if err := h.RecordValue(v); err != nil {
 		return err
@@ -309,6 +313,14 @@ func (h *Histogram) RecordCorrectedValue(v, expectedInterval int64) error {
 
 // RecordValues records n occurrences of the given value, returning an error if
 // the value is out of range or n is negative.
+//
+// Statistical caveat: each recorded unit is treated by TotalCount as one
+// observation. The DKW confidence interval returned by
+// QuantileConfidenceIntervalAt is only valid when n genuinely represents n
+// independent, identically distributed observations of v. Passing a weight or
+// an imputed/duplicated frequency (e.g. counts reconstructed to fill gaps from
+// coordinated omission) does not satisfy that assumption and the interval's
+// coverage guarantee does not apply.
 func (h *Histogram) RecordValues(v, n int64) error {
 	idx := h.countsIndexFor(v)
 	// Single unsigned comparison instead of two signed ones: a negative idx wraps
