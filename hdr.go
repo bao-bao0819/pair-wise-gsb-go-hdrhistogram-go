@@ -261,6 +261,117 @@ func (h *Histogram) StdDev() float64 {
 	return math.Sqrt(geometricDevTotal)
 }
 
+// TrimmedStats describes a rank-trimmed body of the recorded distribution.
+// All three fields are computed on the bucket representative values
+// (medianEquivalentValue of each non-empty bucket), so they are estimates of
+// the corresponding statistics on the original samples, not exact values.
+type TrimmedStats struct {
+	// Weight is the number of retained observations, including the fractional
+	// weights of the buckets the two cut ranks fall into. It equals
+	// (hi - lo) * TotalCount for a non-empty histogram.
+	Weight float64
+	// Mean is the weighted mean of the retained bucket representative values.
+	Mean float64
+	// Variance is the weighted POPULATION variance (denominator Weight, not
+	// Weight-1) of the retained bucket representative values.
+	Variance float64
+}
+
+// TrimmedStatistics returns rank-trimmed statistics over the rank interval
+// [lo*N, hi*N) of the N recorded observations, where N is TotalCount. Ranks
+// are 0-based positions in the sorted sample. Each non-empty bucket is treated
+// as count repeated observations of the bucket's medianEquivalentValue, which
+// together occupy the contiguous rank interval
+// [countToIdx-count, countToIdx); the overlap length of that interval with
+// [lo*N, hi*N) is the bucket's retained weight, so a cut rank landing inside a
+// bucket keeps a fractional weight and the result is still well defined.
+//
+// The walk visits non-empty buckets only and never expands a bucket's count
+// into individual observations. Moments are accumulated with the numerically
+// stable weighted central-moment (West) recurrence, so it neither forms
+// value*count / value*value*count int64 products nor subtracts two large
+// second moments; shifting every recorded value by a large constant leaves the
+// variance intact.
+//
+// lo and hi must satisfy 0 <= lo < hi <= 1; non-finite or out-of-range
+// arguments yield an error. With a non-empty histogram and valid arguments the
+// retained range always contains (hi-lo)*N > 0 observations. An empty
+// histogram (TotalCount == 0) returns the zero TrimmedStats and a nil error.
+// The query is read-only: it does not modify the histogram.
+func (h *Histogram) TrimmedStatistics(lo, hi float64) (TrimmedStats, error) {
+	if math.IsNaN(lo) || math.IsInf(lo, 0) || math.IsNaN(hi) || math.IsInf(hi, 0) {
+		return TrimmedStats{}, fmt.Errorf("trim bounds must be finite, got lo=%v hi=%v", lo, hi)
+	}
+	if lo < 0 || hi > 1 || lo >= hi {
+		return TrimmedStats{}, fmt.Errorf("trim bounds must satisfy 0 <= lo < hi <= 1, got lo=%g hi=%g", lo, hi)
+	}
+	if h.totalCount == 0 {
+		return TrimmedStats{}, nil
+	}
+
+	n := float64(h.totalCount)
+	loRank := lo * n
+	hiRank := hi * n
+
+	var m weightedMoments
+	i := h.rIterator()
+	for i.next() {
+		bucketHi := float64(i.countToIdx) // running cumulative count, exclusive
+		if bucketHi <= loRank {
+			continue // bucket is entirely below the retained rank interval
+		}
+		bucketLo := bucketHi - float64(i.countAtIdx)
+		if bucketLo >= hiRank {
+			break // buckets are visited in ascending value order
+		}
+		weight := math.Min(bucketHi, hiRank) - math.Max(bucketLo, loRank)
+		if weight > 0 {
+			m.add(float64(h.medianEquivalentValue(i.valueFromIdx)), weight)
+		}
+	}
+
+	return TrimmedStats{
+		Weight:   m.weight,
+		Mean:     m.mean,
+		Variance: m.populationVariance(),
+	}, nil
+}
+
+// weightedMoments accumulates the total weight, weighted mean and weighted
+// population second central moment with the West (1979) incremental recurrence.
+// The update only subtracts the new value from the running mean, so a constant
+// offset of arbitrary magnitude cancels out of the variance instead of
+// appearing as the difference of two large floating-point second moments.
+type weightedMoments struct {
+	weight    float64
+	mean      float64
+	centralM2 float64
+}
+
+// add folds weight copies of value into the moments.
+func (m *weightedMoments) add(value, weight float64) {
+	if weight <= 0 {
+		return
+	}
+	newWeight := m.weight + weight
+	delta := value - m.mean
+	contribution := weight / newWeight
+	m.mean += delta * contribution
+	// delta between the new value and the updated mean: the second factor in the
+	// parallel-variance identity.
+	m.centralM2 += weight * delta * (value - m.mean)
+	m.weight = newWeight
+}
+
+// populationVariance returns the weighted population variance (total weight in
+// the denominator).
+func (m *weightedMoments) populationVariance() float64 {
+	if m.weight == 0 {
+		return 0
+	}
+	return m.centralM2 / m.weight
+}
+
 // Reset deletes all recorded values and restores the histogram to its original
 // state.
 func (h *Histogram) Reset() {
