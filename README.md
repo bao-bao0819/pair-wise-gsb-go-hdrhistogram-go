@@ -19,6 +19,27 @@ A pure Go implementation of the [HDR Histogram](https://github.com/HdrHistogram/
 
 For documentation, check [godoc](https://pkg.go.dev/github.com/HdrHistogram/hdrhistogram-go).
 
+## Quantile confidence intervals
+
+`ValueAtPercentile` returns a point estimate from the recorded sample.
+`QuantileConfidenceInterval(q, alpha)` returns a separate interval result with a
+distribution-free Dvoretzky-Kiefer-Wolfowitz coverage statement. It uses
+`TotalCount()` as `N`, computes
+`epsilon = sqrt(log(2/alpha) / (2*N))`, queries the empirical generalized
+inverse at `q-epsilon` and `q+epsilon`, and expands each endpoint to the
+containing HDR bucket's conservative low or high boundary. It performs no
+bootstrap and introduces no random sampling or statistics dependency.
+
+When `q-epsilon <= 0`, the lower endpoint is the nonnegative support bound
+`0`. When `q+epsilon > 1`, `UpperFinite` is false because the current maximum
+is not a finite population-tail bound. Empty histograms, `NaN`, and arguments
+outside `(0, 1)` return identifiable errors.
+
+This guarantee assumes every count represented by `TotalCount()` is a real
+independent and identically distributed observation. Samples synthesized to
+replace coordinated omissions, or arbitrary weighted frequencies passed to
+`RecordValues`, do not automatically satisfy that assumption.
+
 
 ## Getting Started
 
@@ -75,4 +96,3 @@ go mod edit -replace github.com/codahale/hdrhistogram=github.com/HdrHistogram/hd
 -------
 
 Many thanks for Coda Hale for contributing the initial implementation and transfering the repository here.
-

@@ -4,6 +4,7 @@
 package hdrhistogram
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -16,6 +17,36 @@ type Bracket struct {
 	Quantile       float64
 	Count, ValueAt int64
 }
+
+// QuantileConfidenceInterval is a distribution-free confidence interval for a
+// population quantile.
+type QuantileConfidenceInterval struct {
+	// Quantile is the requested q from (0, 1).
+	Quantile float64
+	// Alpha is the requested acceptable failure probability from (0, 1).
+	Alpha float64
+	// N is TotalCount at the time the interval was computed.
+	N int64
+	// Epsilon is the DKW half-width sqrt(log(2/alpha)/(2*N)).
+	Epsilon float64
+	// Lower is the conservative lower endpoint, including the HDR bucket edge.
+	Lower int64
+	// Upper is zero unless UpperFinite is true.
+	Upper int64
+	// UpperFinite reports whether Upper is a finite population-tail bound.
+	UpperFinite bool
+}
+
+var (
+	// ErrInvalidQuantile is returned when a quantile is not a finite value in (0, 1).
+	ErrInvalidQuantile = errors.New("quantile must be a finite value in the open interval (0, 1)")
+	// ErrInvalidFailureProbability is returned when alpha is not a finite value in (0, 1).
+	ErrInvalidFailureProbability = errors.New("failure probability alpha must be a finite value in the open interval (0, 1)")
+	// ErrEmptyHistogram is returned by quantile confidence interval queries when no observations have been recorded.
+	ErrEmptyHistogram = errors.New("cannot compute a quantile confidence interval from an empty histogram")
+	// ErrNilHistogram is returned by quantile confidence interval queries on a nil receiver.
+	ErrNilHistogram = errors.New("cannot compute a quantile confidence interval from a nil histogram")
+)
 
 // A Snapshot is an exported view of a Histogram, useful for serializing them.
 // A Histogram can be constructed from it by passing it to Import.
@@ -287,6 +318,10 @@ func (h *Histogram) RecordValue(v int64) error {
 // at an expected interval (e.g., doing jitter analysis). Processes which are
 // recording ad-hoc values (e.g., latency for incoming requests) can't take
 // advantage of this.
+//
+// The additional values are corrections for inferred omissions. They do not
+// automatically count as independent observations for QuantileConfidenceInterval
+// unless they correspond to real IID measurements.
 func (h *Histogram) RecordCorrectedValue(v, expectedInterval int64) error {
 	if err := h.RecordValue(v); err != nil {
 		return err
@@ -309,6 +344,13 @@ func (h *Histogram) RecordCorrectedValue(v, expectedInterval int64) error {
 
 // RecordValues records n occurrences of the given value, returning an error if
 // the value is out of range or n is negative.
+//
+// QuantileConfidenceInterval treats TotalCount as the number of real
+// observations. Therefore, n is statistically valid there when it represents n
+// independent observations that really occurred. Synthetic values inserted to
+// compensate for coordinated omissions and arbitrary weighted frequencies do
+// not automatically represent independent and identically distributed
+// observations and do not automatically receive that statistical guarantee.
 func (h *Histogram) RecordValues(v, n int64) error {
 	idx := h.countsIndexFor(v)
 	// Single unsigned comparison instead of two signed ones: a negative idx wraps
@@ -390,6 +432,84 @@ func (h *Histogram) ValueAtPercentile(percentile float64) int64 {
 		return h.lowestEquivalentValue(valueFromIdx)
 	}
 	return h.highestEquivalentValue(valueFromIdx)
+}
+
+// QuantileConfidenceInterval returns a conservative confidence interval for the
+// true q-th quantile under the assumption that the recorded observations are
+// independent and identically drawn from one distribution on the nonnegative
+// integers.
+//
+// q is a quantile fraction in (0, 1), unlike the percentile argument accepted
+// by ValueAtPercentile and ValueAtQuantile, which is expressed in [0, 100].
+// alpha is the acceptable failure probability and must also be in (0, 1). With
+// N set to TotalCount, the two-sided Dvoretzky-Kiefer-Wolfowitz bound uses
+// epsilon = sqrt(log(2/alpha) / (2*N)). The empirical distribution's
+// generalized inverse is queried at q-epsilon and q+epsilon. Each endpoint is
+// then expanded to the low or high edge, respectively, of its HDR equivalent
+// value bucket so histogram quantization cannot make the interval less
+// conservative.
+//
+// The DKW bound makes no random resampling and requires no additional
+// statistics dependency. When q-epsilon is at or below zero, the nonnegative
+// support bound gives Lower as zero. When q+epsilon is greater than one, the
+// observed sample cannot establish a finite population upper bound;
+// UpperFinite is false and Upper is zero. The current Max and
+// HighestTrackableValue are never used as population tail limits.
+//
+// This interval carries a coverage claim under its IID premise. ValueAtPercentile
+// remains a point estimate of the recorded sample and makes no such promise.
+func (h *Histogram) QuantileConfidenceInterval(q, alpha float64) (QuantileConfidenceInterval, error) {
+	if h == nil {
+		return QuantileConfidenceInterval{}, ErrNilHistogram
+	}
+	if math.IsNaN(q) || math.IsInf(q, 0) || q <= 0 || q >= 1 {
+		return QuantileConfidenceInterval{}, fmt.Errorf("%w: got %v", ErrInvalidQuantile, q)
+	}
+	if math.IsNaN(alpha) || math.IsInf(alpha, 0) || alpha <= 0 || alpha >= 1 {
+		return QuantileConfidenceInterval{}, fmt.Errorf("%w: got %v", ErrInvalidFailureProbability, alpha)
+	}
+
+	n := h.TotalCount()
+	if n <= 0 {
+		return QuantileConfidenceInterval{}, ErrEmptyHistogram
+	}
+
+	epsilon := math.Sqrt(math.Log(2/alpha) / (2 * float64(n)))
+	result := QuantileConfidenceInterval{
+		Quantile: q,
+		Alpha:    alpha,
+		N:        n,
+		Epsilon:  epsilon,
+	}
+
+	lowerProbability := q - epsilon
+	if lowerProbability <= 0 {
+		result.Lower = 0
+	} else {
+		result.Lower = h.lowestEquivalentValue(h.empiricalQuantile(lowerProbability, n))
+	}
+
+	upperProbability := q + epsilon
+	if upperProbability > 1 {
+		result.UpperFinite = false
+		result.Upper = 0
+	} else {
+		result.UpperFinite = true
+		result.Upper = h.highestEquivalentValue(h.empiricalQuantile(upperProbability, n))
+	}
+
+	return result, nil
+}
+
+func (h *Histogram) empiricalQuantile(p float64, n int64) int64 {
+	rank := int64(math.Ceil(p * float64(n)))
+	if rank < 1 {
+		rank = 1
+	}
+	if rank > n {
+		rank = n
+	}
+	return h.getValueFromIdxUpToCount(rank)
 }
 
 // scanBlock is the fixed block width for the prefix-sum skip-scan. Eight int64
