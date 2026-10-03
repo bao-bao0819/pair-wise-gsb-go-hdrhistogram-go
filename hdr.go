@@ -17,6 +17,16 @@ type Bracket struct {
 	Count, ValueAt int64
 }
 
+// TrimmedStatistics contains rank-trimmed statistics computed from histogram
+// bucket representative values.
+type TrimmedStatistics struct {
+	RetainedWeight float64
+	Mean           float64
+	// Variance is the population variance over the retained bucket
+	// representative values, using RetainedWeight as its denominator.
+	Variance float64
+}
+
 // A Snapshot is an exported view of a Histogram, useful for serializing them.
 // A Histogram can be constructed from it by passing it to Import.
 type Snapshot struct {
@@ -259,6 +269,57 @@ func (h *Histogram) StdDev() float64 {
 	}
 
 	return math.Sqrt(geometricDevTotal)
+}
+
+// TrimmedStatistics returns statistics for ranks in [lo*N, hi*N), where N is
+// TotalCount. Each occupied bucket contributes a fractional retained weight for
+// the intersection of its contiguous rank range with that interval. The query
+// does not modify the histogram.
+func (h *Histogram) TrimmedStatistics(lo, hi float64) (TrimmedStatistics, error) {
+	if math.IsNaN(lo) || math.IsInf(lo, 0) || math.IsNaN(hi) || math.IsInf(hi, 0) {
+		return TrimmedStatistics{}, fmt.Errorf("trimmed statistics bounds must be finite")
+	}
+	if lo < 0 || hi > 1 || lo >= hi {
+		return TrimmedStatistics{}, fmt.Errorf("trimmed statistics bounds must satisfy 0 <= lo < hi <= 1")
+	}
+	if h.totalCount == 0 {
+		return TrimmedStatistics{}, nil
+	}
+
+	loRank := lo * float64(h.totalCount)
+	hiRank := hi * float64(h.totalCount)
+
+	var retainedWeight, mean, m2 float64
+	var rankStart float64
+	i := h.iterator()
+	for i.next() {
+		if i.countAtIdx == 0 {
+			continue
+		}
+
+		count := float64(i.countAtIdx)
+		rankEnd := rankStart + count
+		if rankEnd > loRank && rankStart < hiRank {
+			weight := math.Min(rankEnd, hiRank) - math.Max(rankStart, loRank)
+			if weight > 0 {
+				value := float64(h.medianEquivalentValue(i.valueFromIdx))
+				retainedWeight += weight
+				delta := value - mean
+				mean += delta * weight / retainedWeight
+				m2 += weight * delta * (value - mean)
+			}
+		}
+		rankStart = rankEnd
+	}
+
+	if retainedWeight == 0 {
+		return TrimmedStatistics{}, nil
+	}
+	return TrimmedStatistics{
+		RetainedWeight: retainedWeight,
+		Mean:           mean,
+		Variance:       m2 / retainedWeight,
+	}, nil
 }
 
 // Reset deletes all recorded values and restores the histogram to its original
