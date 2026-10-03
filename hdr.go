@@ -288,22 +288,134 @@ func (h *Histogram) RecordValue(v int64) error {
 // recording ad-hoc values (e.g., latency for incoming requests) can't take
 // advantage of this.
 func (h *Histogram) RecordCorrectedValue(v, expectedInterval int64) error {
-	if err := h.RecordValue(v); err != nil {
-		return err
-	}
+	return h.RecordCorrectedValues(v, 1, expectedInterval)
+}
 
-	if expectedInterval <= 0 || v <= expectedInterval {
+// RecordCorrectedValues records count occurrences of the given value,
+// correcting for stalls in the recording process the same way
+// RecordCorrectedValue does: for each recorded value v it additionally
+// records v-expectedInterval, v-2*expectedInterval, ... while the value
+// being filled in is at least expectedInterval. The result is identical to
+// calling RecordCorrectedValue(v, expectedInterval) count times.
+//
+// This only works for processes which are recording values at an expected
+// interval (e.g., doing jitter analysis); ad-hoc values (e.g., latency of
+// incoming requests) can't take advantage of it.
+//
+// Rather than materializing the v/expectedInterval synthesized values per
+// occurrence (which gets slower the longer a stall is), the descending
+// arithmetic progression is bucketized directly: the number of its terms
+// falling into each HDR bucket is computed from the bucket boundaries in
+// constant time, multiplied by count, and accumulated once. The work is
+// proportional to the number of buckets the progression crosses, never to
+// v/expectedInterval or count.
+//
+// If expectedInterval <= 0, no corrected values are synthesized: count
+// occurrences of v alone are recorded.
+//
+// A count of zero is a no-op (the histogram is not modified and no error is
+// returned, even if v itself is out of range). A negative count is an error.
+// An out-of-range v is an error, as is an int64 overflow of either a bucket's
+// accumulated count or TotalCount. On any error the histogram is left
+// completely unchanged.
+func (h *Histogram) RecordCorrectedValues(v, count, expectedInterval int64) error {
+	if count < 0 {
+		return fmt.Errorf("cannot record a negative count %d", count)
+	}
+	if count == 0 {
 		return nil
 	}
 
-	missingValue := v - expectedInterval
-	for missingValue >= expectedInterval {
-		if err := h.RecordValue(missingValue); err != nil {
-			return err
-		}
-		missingValue -= expectedInterval
+	idx := h.countsIndexFor(v)
+	if uint(idx) >= uint(len(h.counts)) {
+		return fmt.Errorf("value %d is too large to be recorded", v)
 	}
 
+	// Number of observations one RecordCorrectedValue produces: v itself plus
+	// v-d, v-2d, ... down to the last value >= d. The smallest synthesized
+	// value is v-(n-1)d, which lies in [d, 2d).
+	n := int64(1)
+	if expectedInterval > 0 && v > expectedInterval {
+		n = v / expectedInterval
+	}
+
+	// Per-bucket addition c*count is bounded by n*count; rejecting that before
+	// any state change also rules out any individual bucket overflow.
+	if n > math.MaxInt64/count {
+		return fmt.Errorf("recording %d corrected values %d times overflows int64", n, count)
+	}
+	added := n * count
+	if h.totalCount > math.MaxInt64-added {
+		return fmt.Errorf("total count would overflow int64: %d + %d", h.totalCount, added)
+	}
+
+	type bucketAdd struct {
+		idx int
+		add int64
+	}
+	var adds []bucketAdd
+
+	if n == 1 {
+		adds = append(adds, bucketAdd{idx, count})
+	} else {
+		d := expectedInterval
+		missing := v - (n-1)*d
+
+		bucketIdx := h.getBucketIndex(missing)
+		subBucketIdx := h.getSubBucketIdx(missing, bucketIdx)
+		endIdx := idx
+		curIdx := int(h.countsIndex(bucketIdx, subBucketIdx))
+		for curIdx <= endIdx {
+			loEq := h.valueFromIndex(bucketIdx, subBucketIdx)
+			rangeSize := int64(1) << uint(h.unitMagnitude+int64(bucketIdx))
+			hiEq := loEq + rangeSize - 1
+			if hiEq > v {
+				hiEq = v
+			}
+
+			// Count the progression terms t with loEq <= t <= hiEq. Terms are
+			// v-k*d for k in [0, n-1], all positive and at least missing, so
+			// the k bounds must be clamped to [0, n-1]: a bucket can extend
+			// below the smallest synthesized term (e.g. the leading bucket of
+			// a histogram whose lowestDiscernibleValue is greater than 1).
+			//
+			// t <= hiEq  <=>  k >= ceil((v-hiEq)/d)
+			// t >= loEq  <=>  k <= floor((v-loEq)/d)
+			loK := (v - hiEq + d - 1) / d
+			hiK := (v - loEq) / d
+			if hiK > n-1 {
+				hiK = n - 1
+			}
+			c := int64(0)
+			if hiK >= loK {
+				c = hiK - loK + 1
+			}
+			if c > 0 {
+				adds = append(adds, bucketAdd{curIdx, c * count})
+			}
+
+			subBucketIdx++
+			if subBucketIdx >= h.subBucketCount {
+				subBucketIdx = h.subBucketHalfCount
+				bucketIdx++
+			}
+			curIdx = int(h.countsIndex(bucketIdx, subBucketIdx))
+		}
+
+		// Defensive accounting check: every term must have landed in a bucket.
+		var accounted int64
+		for _, a := range adds {
+			accounted += a.add / count
+		}
+		if accounted != n {
+			return fmt.Errorf("internal error: bucketized %d of %d corrected values", accounted, n)
+		}
+	}
+
+	for _, a := range adds {
+		h.counts[a.idx] += a.add
+	}
+	h.totalCount += added
 	return nil
 }
 
