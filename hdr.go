@@ -288,20 +288,102 @@ func (h *Histogram) RecordValue(v int64) error {
 // recording ad-hoc values (e.g., latency for incoming requests) can't take
 // advantage of this.
 func (h *Histogram) RecordCorrectedValue(v, expectedInterval int64) error {
-	if err := h.RecordValue(v); err != nil {
-		return err
-	}
+	return h.RecordCorrectedValues(v, 1, expectedInterval)
+}
 
-	if expectedInterval <= 0 || v <= expectedInterval {
+// RecordCorrectedValues records count occurrences of the given value,
+// correcting for stalls in the recording process. This only works for processes
+// which are recording values at an expected interval (e.g., doing jitter
+// analysis). Processes which are recording ad-hoc values can't take advantage
+// of this.
+//
+// A successful call has the same bucket distribution as calling
+// RecordCorrectedValue count times. When expectedInterval is positive and v is
+// greater than it, the recorded values are v, v-expectedInterval, and so on;
+// the sequence stops before a value smaller than expectedInterval. When
+// expectedInterval is zero or negative, only v is recorded.
+//
+// A count of zero is a no-op and does not validate v. A negative count, a value
+// outside the histogram range, or an int64 overflow in a bucket count or
+// TotalCount returns an error and leaves the histogram unchanged. The arithmetic
+// sequence is aggregated by the HDR buckets it intersects, so the work is
+// proportional to those buckets rather than to v/expectedInterval.
+func (h *Histogram) RecordCorrectedValues(v, count, expectedInterval int64) error {
+	if count < 0 {
+		return fmt.Errorf("cannot record a negative count %d", count)
+	}
+	if count == 0 {
 		return nil
 	}
 
-	missingValue := v - expectedInterval
-	for missingValue >= expectedInterval {
-		if err := h.RecordValue(missingValue); err != nil {
+	observations := int64(1)
+	if expectedInterval > 0 && v >= expectedInterval {
+		observations = v / expectedInterval
+	}
+
+	totalAdded := int64(0)
+	dryRun := func() error {
+		return h.forEachCorrectedValueBucket(v, expectedInterval, observations, func(idx int, terms int64) error {
+			if terms > math.MaxInt64/count {
+				return fmt.Errorf("recording %d occurrences of %d corrected values would overflow int64", count, terms)
+			}
+			added := terms * count
+			if h.counts[idx] > math.MaxInt64-added {
+				return fmt.Errorf("recording %d values in bucket %d would overflow int64", added, idx)
+			}
+			if totalAdded > math.MaxInt64-added {
+				return fmt.Errorf("recording %d corrected values would overflow TotalCount", totalAdded+added)
+			}
+			totalAdded += added
+			return nil
+		})
+	}
+
+	if err := dryRun(); err != nil {
+		return err
+	}
+	if h.totalCount > math.MaxInt64-totalAdded {
+		return fmt.Errorf("TotalCount %d plus %d would overflow int64", h.totalCount, totalAdded)
+	}
+
+	err := h.forEachCorrectedValueBucket(v, expectedInterval, observations, func(idx int, terms int64) error {
+		h.counts[idx] += terms * count
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	h.totalCount += totalAdded
+	return nil
+}
+
+func (h *Histogram) forEachCorrectedValueBucket(v, expectedInterval, observations int64, fn func(idx int, terms int64) error) error {
+	remaining := observations
+	current := v
+
+	for remaining > 0 {
+		idx := h.countsIndexFor(current)
+		if uint(idx) >= uint(len(h.counts)) {
+			return fmt.Errorf("value %d is too large to be recorded", current)
+		}
+
+		terms := int64(1)
+		if observations > 1 {
+			lowest := h.lowestEquivalentValue(current)
+			terms = (current-lowest)/expectedInterval + 1
+			if terms > remaining {
+				terms = remaining
+			}
+		}
+
+		if err := fn(idx, terms); err != nil {
 			return err
 		}
-		missingValue -= expectedInterval
+
+		remaining -= terms
+		if remaining > 0 {
+			current -= terms * expectedInterval
+		}
 	}
 
 	return nil
