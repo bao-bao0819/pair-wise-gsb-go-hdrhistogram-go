@@ -71,8 +71,49 @@ If you are using Go modules, you can update to the exact point of transfter usin
 go mod edit -replace github.com/codahale/hdrhistogram=github.com/HdrHistogram/hdrhistogram-go@v0.9.0
 ```
 
+## Latency tier planner
+----------------------
+
+`PlanSegments(h, k)` splits a histogram into `k` contiguous latency tiers whose
+boundaries are derived from the recorded distribution instead of fixed
+quantiles like p50/p90. Each non-empty bucket contributes its
+`medianEquivalentValue` as representative value and its count as weight; cuts
+are only allowed between two adjacent non-empty buckets, so an equivalent
+bucket is never split. A dynamic program over prefix-sum interval costs finds
+the exact minimum of the total weighted squared error (not an equal-frequency
+or greedy split), and among equal-cost optima the lexicographically smallest
+cut positions win. The result reports each segment's count, mean and squared
+error, the thresholds between segments (the low end of the following
+segment's first bucket) and the total squared error.
+
+```go
+plan, err := hdrhistogram.PlanSegments(hist, 4)
+if err != nil {
+    // k < 1, k greater than the number of non-empty buckets, or the
+    // MaxPlanBuckets / MaxPlanSegments limits were exceeded.
+}
+for _, s := range plan.Segments {
+    fmt.Printf("[%d, %d] count=%d mean=%.1f sse=%.1f\n",
+        s.LowValue, s.HighValue, s.Count, s.Mean, s.SSE)
+}
+fmt.Println("thresholds:", plan.Thresholds, "total SSE:", plan.TotalSSE)
+```
+
+Complexity: for `n` non-empty buckets the planner runs in `O(k*n^2)` time and
+`O(k*n)` space. The exported `MaxPlanBuckets` (default 2048) and
+`MaxPlanSegments` (default 256) variables bound this cost and are checked
+before any computation; the source histogram is never down-sampled. All
+statistics are accumulated in `float64`, so large counts cannot overflow an
+`int64` product.
+
+Sample benchmark (`BenchmarkPlanSegments`, ~940 non-empty buckets, k=8,
+Intel i5-12600KF):
+
+```
+BenchmarkPlanSegments-16   200   5352480 ns/op   213033 B/op   83 allocs/op
+```
+
 ## Credits
 -------
 
 Many thanks for Coda Hale for contributing the initial implementation and transfering the repository here.
-
